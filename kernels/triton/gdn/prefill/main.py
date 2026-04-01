@@ -135,10 +135,16 @@ def profile_kernel(
 
 
 def fused_preprocessing_io_bytes(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor, g: torch.Tensor) -> int:
-    b, t, h, _k = k.shape
-    h_beta = beta.shape[-1]
+    # k: [B, T, Hg, K]  — Hg = key heads;  v/beta/g: [B, T, H, ...]  — H = value heads (H 可与 Hg 不同)
+    b, t, hg, k_dim = k.shape
+    h = beta.shape[-1]
+    assert g.shape == beta.shape and v.shape[:3] == beta.shape
     read_b = k.nbytes + v.nbytes + beta.nbytes + g.nbytes
-    write_b = g.numel() * 4 + b * t * h_beta * _k * k.element_size() + v.nbytes
+    # 写回与 fused_preprocessing_fwd 一致（字节 = 下表 nbytes 之和）:
+    #   g_cumsum  torch.empty_like(g, dtype=torch.float32)  [B,T,H] 同 g/beta  float32 → g.numel() * 4
+    #   w         k.new_empty(B, T, H, K)                   [B,T,H,K]，H=beta 的 head 数，K=k.shape[-1]  同 k dtype → B*T*H*K*element_size
+    #   u         torch.empty_like(v)                       与 v 一致，一般为 [B,T,H,V]  → v.nbytes
+    write_b = g.numel() * 4 + b * t * h * k_dim * k.element_size() + v.nbytes
     return read_b + write_b
 
 
