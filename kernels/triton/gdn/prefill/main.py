@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from fla.ops.chunk import chunk_gated_delta_rule, profile_chunk_gated_delta_rule
+from fla.ops.fused_preprocessing import fused_preprocessing_fwd
 
 from vllm.triton_utils import tl, triton
 import triton.profiler as proton
@@ -132,6 +133,45 @@ def profile_kernel(
         use_fusion=fusion,
     )
 
+
+def fused_preprocessing_io_bytes(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor, g: torch.Tensor) -> int:
+    b, t, h, _k = k.shape
+    h_beta = beta.shape[-1]
+    read_b = k.nbytes + v.nbytes + beta.nbytes + g.nbytes
+    write_b = g.numel() * 4 + b * t * h_beta * _k * k.element_size() + v.nbytes
+    return read_b + write_b
+
+
+def bench_fused_preprocessing_bandwidth(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g: torch.Tensor,
+    warmup_iters: int,
+    iters: int,
+) -> None:
+    total_bytes = fused_preprocessing_io_bytes(k, v, beta, g)
+    for _ in range(warmup_iters):
+        fused_preprocessing_fwd(k=k, v=v, beta=beta, g=g, cu_seqlens=None)
+    torch.cuda.synchronize()
+
+    ev0 = torch.cuda.Event(enable_timing=True)
+    ev1 = torch.cuda.Event(enable_timing=True)
+    dts_ms = []
+    for _ in range(iters):
+        ev0.record()
+        fused_preprocessing_fwd(k=k, v=v, beta=beta, g=g, cu_seqlens=None)
+        ev1.record()
+        torch.cuda.synchronize()
+        dts_ms.append(ev0.elapsed_time(ev1))
+
+    mean_ms = float(np.mean(dts_ms))
+    gbps = total_bytes * 1e-6 / mean_ms
+    print(
+        f"fused_preprocessing_fwd: {gbps:.3f} GB/s (mean {mean_ms:.4f} ms, read+write {total_bytes} B, n={iters})"
+    )
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument(
@@ -162,6 +202,12 @@ def main():
         action="store_true",
         help="Use fused matrix-inverse kernel (chunk_size=64).",
     )
+    parser.add_argument(
+        "--bandwidth",
+        action="store_true",
+        help="Measure fused_preprocessing_fwd GB/s (requires --fusion).",
+    )
+
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -207,6 +253,12 @@ def main():
             args.warmup_iters,
             args.iters,
             fusion=args.fusion,
+        )
+        return
+
+    if args.bandwidth and args.fusion:
+        bench_fused_preprocessing_bandwidth(
+            k, v, beta, g, args.warmup_iters, args.iters
         )
         return
 
